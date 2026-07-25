@@ -8,12 +8,16 @@
   <meta name="theme-color" content="#1c2b1e" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-title" content="PDF Merger" />
   <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #f4f1ec; font-family: 'Inter', sans-serif; min-height: 100vh; }
-    .drop-active { border-color: #1c2b1e !important; background: #e8f0e8 !important; }
+    body { background: #f4f1ec; font-family: 'Inter', sans-serif; min-height: 100vh; user-select: none; }
+    .page-card { transition: opacity 0.15s, border-color 0.15s; cursor: grab; }
+    .page-card:active { cursor: grabbing; }
+    .page-card.dragging { opacity: 0.35; }
+    .page-card.drag-over { border-color: #1c2b1e !important; box-shadow: 0 0 0 2px #1c2b1e; }
+    .thumb-wrap { position: relative; overflow: hidden; background: #eee; }
+    .thumb-wrap img { width: 100%; display: block; transition: transform 0.25s; transform-origin: center center; }
   </style>
 </head>
 <body>
@@ -30,14 +34,14 @@
 
     let pageIdCounter = 0;
 
-    async function renderThumbnail(pdfDoc, pageNum, scale = 0.25) {
+    async function renderThumbnail(pdfDoc, pageNum, scale = 0.28) {
       const page = await pdfDoc.getPage(pageNum);
       const viewport = page.getViewport({ scale });
       const canvas = document.createElement('canvas');
       canvas.width = viewport.width;
       canvas.height = viewport.height;
       await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-      return canvas.toDataURL('image/jpeg', 0.7);
+      return { dataUrl: canvas.toDataURL('image/jpeg', 0.75), w: viewport.width, h: viewport.height };
     }
 
     function App() {
@@ -45,8 +49,13 @@
       const [loading, setLoading] = useState(false);
       const [loadingText, setLoadingText] = useState('');
       const [merging, setMerging] = useState(false);
-      const [isDragging, setIsDragging] = useState(false);
+      const [isDragOver, setIsDragOver] = useState(false);
       const fileInputRef = useRef();
+
+      // Drag & Drop state
+      const dragId = useRef(null);
+      const [draggingId, setDraggingId] = useState(null);
+      const [dragOverId, setDragOverId] = useState(null);
 
       const processFiles = async (files) => {
         const pdfFiles = Array.from(files).filter(f => f.type === 'application/pdf' || f.name.endsWith('.pdf'));
@@ -62,55 +71,112 @@
           const pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes }).promise;
           for (let pi = 1; pi <= pdfDoc.numPages; pi++) {
             setLoadingText(`${file.name}: Seite ${pi}/${pdfDoc.numPages}`);
-            const thumbnail = await renderThumbnail(pdfDoc, pi);
+            const { dataUrl, w, h } = await renderThumbnail(pdfDoc, pi);
             newPages.push({
               id: ++pageIdCounter,
-              fileId,
-              fileName: file.name,
-              pageIndex: pi - 1,
-              pageNum: pi,
-              totalPages: pdfDoc.numPages,
-              thumbnail,
-              pdfBytes,
-              included: true,
+              fileId, fileName: file.name,
+              pageIndex: pi - 1, pageNum: pi, totalPages: pdfDoc.numPages,
+              thumbnail: dataUrl, thumbW: w, thumbH: h,
+              pdfBytes, included: true, rotation: 0,
             });
           }
         }
         setPages(prev => [...prev, ...newPages]);
-        setLoading(false);
-        setLoadingText('');
+        setLoading(false); setLoadingText('');
       };
 
       const onFileChange = (e) => { processFiles(e.target.files); e.target.value = ''; };
-
-      const onDrop = useCallback((e) => {
-        e.preventDefault();
-        setIsDragging(false);
-        processFiles(e.dataTransfer.files);
-      }, []);
+      const onDrop = useCallback((e) => { e.preventDefault(); setIsDragOver(false); processFiles(e.dataTransfer.files); }, []);
 
       const togglePage = (id) => setPages(prev => prev.map(p => p.id === id ? { ...p, included: !p.included } : p));
       const removePage = (id) => setPages(prev => prev.filter(p => p.id !== id));
-      const moveUp = (idx) => {
-        if (idx === 0) return;
-        setPages(prev => { const a = [...prev]; [a[idx-1], a[idx]] = [a[idx], a[idx-1]]; return a; });
-      };
-      const moveDown = (idx) => {
-        setPages(prev => {
-          if (idx === prev.length - 1) return prev;
-          const a = [...prev]; [a[idx], a[idx+1]] = [a[idx+1], a[idx]]; return a;
-        });
-      };
+      const rotatePage = (id) => setPages(prev => prev.map(p => p.id === id ? { ...p, rotation: (p.rotation + 90) % 360 } : p));
       const removeAll = () => setPages([]);
       const includeAll = () => setPages(prev => prev.map(p => ({ ...p, included: true })));
       const excludeAll = () => setPages(prev => prev.map(p => ({ ...p, included: false })));
 
+      // ── Drag & Drop Reorder ──────────────────────────────────────────────
+      const onDragStart = (e, id) => {
+        dragId.current = id;
+        setDraggingId(id);
+        e.dataTransfer.effectAllowed = 'move';
+        // Needed for Firefox
+        e.dataTransfer.setData('text/plain', id);
+      };
+      const onDragOver = (e, id) => { e.preventDefault(); if (id !== dragId.current) setDragOverId(id); };
+      const onDragEnd = () => { setDraggingId(null); setDragOverId(null); dragId.current = null; };
+      const onDropCard = (e, targetId) => {
+        e.preventDefault();
+        const fromId = dragId.current;
+        if (!fromId || fromId === targetId) { onDragEnd(); return; }
+        setPages(prev => {
+          const arr = [...prev];
+          const fromIdx = arr.findIndex(p => p.id === fromId);
+          const toIdx = arr.findIndex(p => p.id === targetId);
+          const [moved] = arr.splice(fromIdx, 1);
+          arr.splice(toIdx, 0, moved);
+          return arr;
+        });
+        onDragEnd();
+      };
+
+      // ── Touch Drag & Drop ─────────────────────────────────────────────────
+      const touchDragId = useRef(null);
+      const touchStartY = useRef(0);
+      const touchStartX = useRef(0);
+      const touchMoved = useRef(false);
+
+      const onTouchStart = (e, id) => {
+        touchDragId.current = id;
+        touchStartY.current = e.touches[0].clientY;
+        touchStartX.current = e.touches[0].clientX;
+        touchMoved.current = false;
+      };
+      const onTouchMove = (e) => {
+        const dy = Math.abs(e.touches[0].clientY - touchStartY.current);
+        const dx = Math.abs(e.touches[0].clientX - touchStartX.current);
+        if (dy > 8 || dx > 8) {
+          touchMoved.current = true;
+          if (touchDragId.current) setDraggingId(touchDragId.current);
+        }
+        if (!touchMoved.current) return;
+        e.preventDefault();
+        // Find element under touch
+        const el = document.elementFromPoint(e.touches[0].clientX, e.touches[0].clientY);
+        const card = el && el.closest('[data-pageid]');
+        if (card) {
+          const overId = parseInt(card.getAttribute('data-pageid'));
+          if (overId && overId !== touchDragId.current) setDragOverId(overId);
+        }
+      };
+      const onTouchEnd = () => {
+        if (touchMoved.current && touchDragId.current && dragOverId) {
+          const fromId = touchDragId.current;
+          const targetId = dragOverId;
+          setPages(prev => {
+            const arr = [...prev];
+            const fromIdx = arr.findIndex(p => p.id === fromId);
+            const toIdx = arr.findIndex(p => p.id === targetId);
+            if (fromIdx !== toIdx) {
+              const [moved] = arr.splice(fromIdx, 1);
+              arr.splice(toIdx, 0, moved);
+            }
+            return arr;
+          });
+        }
+        touchDragId.current = null;
+        touchMoved.current = false;
+        setDraggingId(null);
+        setDragOverId(null);
+      };
+
+      // ── Merge ─────────────────────────────────────────────────────────────
       const mergePDFs = async () => {
         const included = pages.filter(p => p.included);
         if (included.length === 0) { alert('Keine Seiten ausgewählt!'); return; }
         setMerging(true);
         try {
-          const { PDFDocument } = PDFLib;
+          const { PDFDocument, degrees } = PDFLib;
           const merged = await PDFDocument.create();
           const cache = new Map();
           for (const page of included) {
@@ -119,33 +185,34 @@
             }
             const src = cache.get(page.fileId);
             const [copied] = await merged.copyPages(src, [page.pageIndex]);
+            if (page.rotation !== 0) {
+              const existing = copied.getRotation().angle;
+              copied.setRotation(degrees((existing + page.rotation) % 360));
+            }
             merged.addPage(copied);
           }
           const bytes = await merged.save();
           const blob = new Blob([bytes], { type: 'application/pdf' });
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
-          a.href = url;
-          a.download = `DF_Zusammengefuegt_${new Date().toLocaleDateString('de-DE').replace(/\./g, '-')}.pdf`;
+          a.href = url; a.download = `DF_${new Date().toLocaleDateString('de-DE').replace(/\./g,'-')}.pdf`;
           a.click();
           setTimeout(() => URL.revokeObjectURL(url), 3000);
-        } catch (e) {
-          alert('Fehler beim Zusammenfügen: ' + e.message);
-        }
+        } catch(e) { alert('Fehler: ' + e.message); }
         setMerging(false);
       };
 
       const includedCount = pages.filter(p => p.included).length;
 
-      const btn = (onClick, label, bg, color, border) => (
-        <div onClick={onClick} style={{ padding: "10px 16px", background: bg, border: `1px solid ${border}`, borderRadius: 4, color, fontSize: "0.82rem", fontWeight: 600, cursor: "pointer", textAlign: "center", userSelect: "none" }}>
+      const smBtn = (onClick, label, bg, color, border) => (
+        <button onClick={onClick} style={{ flex: 1, padding: "5px 2px", border: `1px solid ${border}`, borderRadius: 3, background: bg, color, cursor: "pointer", fontSize: "0.78rem", fontWeight: 600 }}>
           {label}
-        </div>
+        </button>
       );
 
       return (
         <div style={{ minHeight: "100vh", background: "#f4f1ec", padding: "16px 12px 40px" }}>
-          <div style={{ maxWidth: 700, margin: "0 auto" }}>
+          <div style={{ maxWidth: 720, margin: "0 auto" }}>
 
             {/* Header */}
             <div style={{ background: "#1c2b1e", borderRadius: 6, padding: "18px 22px", marginBottom: 14 }}>
@@ -155,110 +222,135 @@
 
             {/* Upload Zone */}
             <div
-              onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
-              onDragLeave={() => setIsDragging(false)}
+              onDragOver={e => { e.preventDefault(); setIsDragOver(true); }}
+              onDragLeave={() => setIsDragOver(false)}
               onDrop={onDrop}
               onClick={() => fileInputRef.current.click()}
-              style={{
-                border: `2px dashed ${isDragging ? '#1c2b1e' : '#bbb'}`,
-                borderRadius: 6, padding: "30px 20px",
-                textAlign: "center", cursor: "pointer",
-                background: isDragging ? '#e8f0e8' : '#fff',
-                marginBottom: 14, transition: "all 0.2s"
-              }}>
-              <div style={{ fontSize: "2.5rem", marginBottom: 10 }}>📂</div>
-              <div style={{ fontSize: "1rem", color: "#333", fontWeight: 600, marginBottom: 4 }}>PDFs hier ablegen oder antippen</div>
-              <div style={{ fontSize: "0.8rem", color: "#888" }}>Mehrere Dateien gleichzeitig möglich</div>
+              style={{ border: `2px dashed ${isDragOver ? '#1c2b1e' : '#bbb'}`, borderRadius: 6, padding: "28px 20px", textAlign: "center", cursor: "pointer", background: isDragOver ? '#e8f0e8' : '#fff', marginBottom: 14, transition: "all 0.2s" }}>
+              <div style={{ fontSize: "2.2rem", marginBottom: 8 }}>📂</div>
+              <div style={{ fontSize: "0.95rem", color: "#333", fontWeight: 600, marginBottom: 4 }}>PDFs hier ablegen oder antippen</div>
+              <div style={{ fontSize: "0.78rem", color: "#888" }}>Mehrere Dateien gleichzeitig möglich</div>
               <input ref={fileInputRef} type="file" accept=".pdf,application/pdf" multiple onChange={onFileChange} style={{ display: "none" }} />
             </div>
 
             {/* Loading */}
             {loading && (
-              <div style={{ background: "#1c2b1e", borderRadius: 6, padding: "16px 20px", marginBottom: 14, textAlign: "center" }}>
-                <div style={{ color: "#a8c5a0", fontSize: "0.88rem" }}>⏳ {loadingText}</div>
-                <div style={{ background: "#2e4030", borderRadius: 4, height: 4, marginTop: 10, overflow: "hidden" }}>
-                  <div style={{ background: "#7aaa7a", height: "100%", width: "60%", animation: "none" }} />
-                </div>
+              <div style={{ background: "#1c2b1e", borderRadius: 6, padding: "14px 20px", marginBottom: 14, textAlign: "center" }}>
+                <div style={{ color: "#a8c5a0", fontSize: "0.85rem" }}>⏳ {loadingText}</div>
               </div>
             )}
 
             {/* Toolbar */}
             {pages.length > 0 && (
-              <div style={{ background: "#fff", border: "1px solid #ddd6c8", borderRadius: 6, padding: "12px 16px", marginBottom: 14, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                <span style={{ fontSize: "0.82rem", color: "#555", marginRight: 4 }}>
-                  <strong>{includedCount}</strong> von <strong>{pages.length}</strong> Seiten ausgewählt
+              <div style={{ background: "#fff", border: "1px solid #ddd6c8", borderRadius: 6, padding: "10px 14px", marginBottom: 12, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ fontSize: "0.8rem", color: "#555" }}>
+                  <strong>{includedCount}</strong> / <strong>{pages.length}</strong> Seiten ausgewählt
                 </span>
                 <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {btn(includeAll, "✅ Alle an", "#eef5ee", "#1c2b1e", "#a8c5a0")}
-                  {btn(excludeAll, "❌ Alle aus", "#fff5f5", "#c0392b", "#f0a0a0")}
-                  {btn(removeAll, "🗑️ Alle löschen", "#fff", "#888", "#ddd")}
+                  <button onClick={includeAll} style={{ padding: "6px 10px", border: "1px solid #a8c5a0", borderRadius: 4, background: "#eef5ee", color: "#1c2b1e", cursor: "pointer", fontSize: "0.78rem", fontWeight: 600 }}>✅ Alle an</button>
+                  <button onClick={excludeAll} style={{ padding: "6px 10px", border: "1px solid #f0a0a0", borderRadius: 4, background: "#fff5f5", color: "#c0392b", cursor: "pointer", fontSize: "0.78rem", fontWeight: 600 }}>❌ Alle aus</button>
+                  <button onClick={removeAll} style={{ padding: "6px 10px", border: "1px solid #ddd", borderRadius: 4, background: "#fff", color: "#888", cursor: "pointer", fontSize: "0.78rem", fontWeight: 600 }}>🗑️ Alle löschen</button>
                 </div>
+              </div>
+            )}
+
+            {/* Hinweis */}
+            {pages.length > 0 && (
+              <div style={{ fontSize: "0.72rem", color: "#888", textAlign: "center", marginBottom: 10 }}>
+                ☰ Karte anfassen &amp; ziehen zum Umsortieren · 🔄 Drehen · ✓/○ Ein/Ausblenden · ✕ Löschen
               </div>
             )}
 
             {/* Seiten Grid */}
             {pages.length > 0 && (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 16 }}>
-                {pages.map((page, idx) => (
-                  <div key={page.id} style={{
-                    background: page.included ? "#fff" : "#f0f0f0",
-                    border: `2px solid ${page.included ? "#a8c5a0" : "#ddd"}`,
-                    borderRadius: 6, overflow: "hidden",
-                    opacity: page.included ? 1 : 0.5,
-                    transition: "all 0.15s"
-                  }}>
-                    {/* Vorschaubild */}
-                    <div style={{ position: "relative", cursor: "pointer" }} onClick={() => togglePage(page.id)}>
-                      <img src={page.thumbnail} alt={`Seite ${page.pageNum}`}
-                        style={{ width: "100%", display: "block" }} />
-                      {!page.included && (
-                        <div style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                          <span style={{ color: "#fff", fontSize: "1.8rem" }}>✕</span>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 10, marginBottom: 16 }}>
+                {pages.map((page) => {
+                  const rot = page.rotation;
+                  const is90 = rot === 90 || rot === 270;
+                  // For rotated thumbnails, we need to adjust the container height
+                  const aspect = page.thumbH / page.thumbW;
+                  const containerPad = is90 ? `${(1 / aspect) * 100}%` : `${aspect * 100}%`;
+
+                  return (
+                    <div
+                      key={page.id}
+                      data-pageid={page.id}
+                      className={`page-card${draggingId === page.id ? ' dragging' : ''}${dragOverId === page.id ? ' drag-over' : ''}`}
+                      draggable
+                      onDragStart={e => onDragStart(e, page.id)}
+                      onDragOver={e => onDragOver(e, page.id)}
+                      onDrop={e => onDropCard(e, page.id)}
+                      onDragEnd={onDragEnd}
+                      onTouchStart={e => onTouchStart(e, page.id)}
+                      onTouchMove={onTouchMove}
+                      onTouchEnd={onTouchEnd}
+                      style={{
+                        background: page.included ? "#fff" : "#f0f0f0",
+                        border: `2px solid ${dragOverId === page.id ? '#1c2b1e' : page.included ? "#a8c5a0" : "#ddd"}`,
+                        borderRadius: 6, overflow: "hidden",
+                        opacity: (draggingId === page.id) ? 0.35 : page.included ? 1 : 0.55,
+                      }}>
+
+                      {/* Drag handle + Dateiname */}
+                      <div style={{ background: "#1c2b1e", padding: "4px 6px", display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ color: "#7aaa7a", fontSize: "0.85rem", lineHeight: 1 }}>☰</span>
+                        <span style={{ color: "#a8c5a0", fontSize: "0.6rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={page.fileName}>{page.fileName}</span>
+                      </div>
+
+                      {/* Vorschaubild */}
+                      <div
+                        className="thumb-wrap"
+                        style={{ paddingBottom: containerPad, position: "relative" }}
+                        onClick={() => togglePage(page.id)}>
+                        <img
+                          src={page.thumbnail}
+                          alt={`Seite ${page.pageNum}`}
+                          style={{
+                            position: "absolute", top: "50%", left: "50%",
+                            transform: `translate(-50%, -50%) rotate(${rot}deg)`,
+                            width: is90 ? `${aspect * 100}%` : "100%",
+                            maxWidth: "none",
+                          }}
+                        />
+                        {!page.included && (
+                          <div style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 2 }}>
+                            <span style={{ color: "#fff", fontSize: "2rem" }}>✕</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Info + Buttons */}
+                      <div style={{ padding: "6px 6px 6px" }}>
+                        <div style={{ fontSize: "0.68rem", color: "#666", marginBottom: 5, textAlign: "center" }}>
+                          Seite {page.pageNum}/{page.totalPages}
+                          {page.rotation > 0 && <span style={{ color: "#1c2b1e", marginLeft: 4 }}>{page.rotation}°</span>}
                         </div>
-                      )}
-                    </div>
-
-                    {/* Info */}
-                    <div style={{ padding: "6px 8px" }}>
-                      <div style={{ fontSize: "0.7rem", color: "#888", marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={page.fileName}>
-                        {page.fileName}
-                      </div>
-                      <div style={{ fontSize: "0.72rem", color: "#555", marginBottom: 6 }}>
-                        Seite {page.pageNum}/{page.totalPages}
-                      </div>
-
-                      {/* Buttons */}
-                      <div style={{ display: "flex", gap: 4 }}>
-                        <button onClick={() => moveUp(idx)} disabled={idx === 0}
-                          style={{ flex: 1, padding: "4px 0", border: "1px solid #ddd", borderRadius: 3, background: idx === 0 ? "#f5f5f5" : "#fff", cursor: idx === 0 ? "default" : "pointer", fontSize: "0.8rem", color: idx === 0 ? "#ccc" : "#555" }}>↑</button>
-                        <button onClick={() => moveDown(idx)} disabled={idx === pages.length - 1}
-                          style={{ flex: 1, padding: "4px 0", border: "1px solid #ddd", borderRadius: 3, background: idx === pages.length - 1 ? "#f5f5f5" : "#fff", cursor: idx === pages.length - 1 ? "default" : "pointer", fontSize: "0.8rem", color: idx === pages.length - 1 ? "#ccc" : "#555" }}>↓</button>
-                        <button onClick={() => togglePage(page.id)}
-                          style={{ flex: 1, padding: "4px 0", border: `1px solid ${page.included ? "#a8c5a0" : "#ddd"}`, borderRadius: 3, background: page.included ? "#eef5ee" : "#fff", cursor: "pointer", fontSize: "0.75rem", color: page.included ? "#1c2b1e" : "#999" }}>
-                          {page.included ? "✓" : "○"}
-                        </button>
-                        <button onClick={() => removePage(page.id)}
-                          style={{ flex: 1, padding: "4px 0", border: "1px solid #f0a0a0", borderRadius: 3, background: "#fff5f5", cursor: "pointer", fontSize: "0.75rem", color: "#c0392b" }}>✕</button>
+                        <div style={{ display: "flex", gap: 3 }}>
+                          {smBtn(() => rotatePage(page.id), "🔄", "#fff", "#555", "#ddd")}
+                          {smBtn(() => togglePage(page.id), page.included ? "✓" : "○", page.included ? "#eef5ee" : "#fff", page.included ? "#1c2b1e" : "#aaa", page.included ? "#a8c5a0" : "#ddd")}
+                          {smBtn(() => removePage(page.id), "✕", "#fff5f5", "#c0392b", "#f0a0a0")}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
-            {/* Zusammenführen Button */}
+            {/* Merge Button */}
             {pages.length > 0 && (
-              <div onClick={!merging && includedCount > 0 ? mergePDFs : undefined}
+              <button
+                onClick={!merging && includedCount > 0 ? mergePDFs : undefined}
                 style={{
-                  padding: "16px", background: includedCount > 0 ? "#1c2b1e" : "#ccc",
-                  borderRadius: 6, color: includedCount > 0 ? "#a8c5a0" : "#888",
+                  width: "100%", padding: "16px",
+                  background: includedCount > 0 ? "#1c2b1e" : "#ccc",
+                  border: "none", borderRadius: 6,
+                  color: includedCount > 0 ? "#a8c5a0" : "#888",
                   fontFamily: "'Bebas Neue', sans-serif", fontSize: "1.3rem",
-                  letterSpacing: "0.06em", textAlign: "center",
-                  cursor: includedCount > 0 && !merging ? "pointer" : "default",
-                  userSelect: "none", transition: "all 0.2s"
+                  letterSpacing: "0.06em", cursor: includedCount > 0 && !merging ? "pointer" : "default"
                 }}>
                 {merging ? "⏳ Wird zusammengefügt..." : `💾 ${includedCount} Seiten als PDF speichern`}
-              </div>
+              </button>
             )}
 
             {pages.length === 0 && !loading && (
@@ -276,11 +368,8 @@
     }
 
     ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-
     if ("serviceWorker" in navigator) {
-      window.addEventListener("load", () => {
-        navigator.serviceWorker.register("./sw.js").catch(() => {});
-      });
+      window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
     }
   </script>
 </body>
