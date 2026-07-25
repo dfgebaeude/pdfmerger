@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>DF PDF Zusammenfügen</title>
+  <link rel="manifest" href="./manifest.json" />
+  <meta name="theme-color" content="#1c2b1e" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="PDF Merger" />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #f4f1ec; font-family: 'Inter', sans-serif; min-height: 100vh; }
+    .drop-active { border-color: #1c2b1e !important; background: #e8f0e8 !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useRef, useCallback } = React;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    let pageIdCounter = 0;
+
+    async function renderThumbnail(pdfDoc, pageNum, scale = 0.25) {
+      const page = await pdfDoc.getPage(pageNum);
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement('canvas');
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+      return canvas.toDataURL('image/jpeg', 0.7);
+    }
+
+    function App() {
+      const [pages, setPages] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [loadingText, setLoadingText] = useState('');
+      const [merging, setMerging] = useState(false);
+      const [isDragging, setIsDragging] = useState(false);
+      const fileInputRef = useRef();
+
+      const processFiles = async (files) => {
+        const pdfFiles = Array.from(files).filter(f => f.type === 'application/pdf' || f.name.endsWith('.pdf'));
+        if (pdfFiles.length === 0) return;
+        setLoading(true);
+        const newPages = [];
+        for (let fi = 0; fi < pdfFiles.length; fi++) {
+          const file = pdfFiles[fi];
+          setLoadingText(`Lade ${file.name} (${fi + 1}/${pdfFiles.length})...`);
+          const arrayBuffer = await file.arrayBuffer();
+          const pdfBytes = new Uint8Array(arrayBuffer);
+          const fileId = `file_${Date.now()}_${fi}`;
+          const pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes }).promise;
+          for (let pi = 1; pi <= pdfDoc.numPages; pi++) {
+            setLoadingText(`${file.name}: Seite ${pi}/${pdfDoc.numPages}`);
+            const thumbnail = await renderThumbnail(pdfDoc, pi);
+            newPages.push({
+              id: ++pageIdCounter,
+              fileId,
+              fileName: file.name,
+              pageIndex: pi - 1,
+              pageNum: pi,
+              totalPages: pdfDoc.numPages,
+              thumbnail,
+              pdfBytes,
+              included: true,
+            });
+          }
+        }
+        setPages(prev => [...prev, ...newPages]);
+        setLoading(false);
+        setLoadingText('');
+      };
+
+      const onFileChange = (e) => { processFiles(e.target.files); e.target.value = ''; };
+
+      const onDrop = useCallback((e) => {
+        e.preventDefault();
+        setIsDragging(false);
+        processFiles(e.dataTransfer.files);
+      }, []);
+
+      const togglePage = (id) => setPages(prev => prev.map(p => p.id === id ? { ...p, included: !p.included } : p));
+      const removePage = (id) => setPages(prev => prev.filter(p => p.id !== id));
+      const moveUp = (idx) => {
+        if (idx === 0) return;
+        setPages(prev => { const a = [...prev]; [a[idx-1], a[idx]] = [a[idx], a[idx-1]]; return a; });
+      };
+      const moveDown = (idx) => {
+        setPages(prev => {
+          if (idx === prev.length - 1) return prev;
+          const a = [...prev]; [a[idx], a[idx+1]] = [a[idx+1], a[idx]]; return a;
+        });
+      };
+      const removeAll = () => setPages([]);
+      const includeAll = () => setPages(prev => prev.map(p => ({ ...p, included: true })));
+      const excludeAll = () => setPages(prev => prev.map(p => ({ ...p, included: false })));
+
+      const mergePDFs = async () => {
+        const included = pages.filter(p => p.included);
+        if (included.length === 0) { alert('Keine Seiten ausgewählt!'); return; }
+        setMerging(true);
+        try {
+          const { PDFDocument } = PDFLib;
+          const merged = await PDFDocument.create();
+          const cache = new Map();
+          for (const page of included) {
+            if (!cache.has(page.fileId)) {
+              cache.set(page.fileId, await PDFDocument.load(page.pdfBytes));
+            }
+            const src = cache.get(page.fileId);
+            const [copied] = await merged.copyPages(src, [page.pageIndex]);
+            merged.addPage(copied);
+          }
+          const bytes = await merged.save();
+          const blob = new Blob([bytes], { type: 'application/pdf' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `DF_Zusammengefuegt_${new Date().toLocaleDateString('de-DE').replace(/\./g, '-')}.pdf`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 3000);
+        } catch (e) {
+          alert('Fehler beim Zusammenfügen: ' + e.message);
+        }
+        setMerging(false);
+      };
+
+      const includedCount = pages.filter(p => p.included).length;
+
+      const btn = (onClick, label, bg, color, border) => (
+        <div onClick={onClick} style={{ padding: "10px 16px", background: bg, border: `1px solid ${border}`, borderRadius: 4, color, fontSize: "0.82rem", fontWeight: 600, cursor: "pointer", textAlign: "center", userSelect: "none" }}>
+          {label}
+        </div>
+      );
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#f4f1ec", padding: "16px 12px 40px" }}>
+          <div style={{ maxWidth: 700, margin: "0 auto" }}>
+
+            {/* Header */}
+            <div style={{ background: "#1c2b1e", borderRadius: 6, padding: "18px 22px", marginBottom: 14 }}>
+              <div style={{ color: "#7aaa7a", fontSize: "0.6rem", letterSpacing: "0.2em", textTransform: "uppercase", marginBottom: 4 }}>DF Gebäudeservice</div>
+              <h1 style={{ color: "#f4f1ec", fontFamily: "'Bebas Neue', sans-serif", fontSize: "2rem", letterSpacing: "0.04em" }}>PDF Zusammenfügen</h1>
+            </div>
+
+            {/* Upload Zone */}
+            <div
+              onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={onDrop}
+              onClick={() => fileInputRef.current.click()}
+              style={{
+                border: `2px dashed ${isDragging ? '#1c2b1e' : '#bbb'}`,
+                borderRadius: 6, padding: "30px 20px",
+                textAlign: "center", cursor: "pointer",
+                background: isDragging ? '#e8f0e8' : '#fff',
+                marginBottom: 14, transition: "all 0.2s"
+              }}>
+              <div style={{ fontSize: "2.5rem", marginBottom: 10 }}>📂</div>
+              <div style={{ fontSize: "1rem", color: "#333", fontWeight: 600, marginBottom: 4 }}>PDFs hier ablegen oder antippen</div>
+              <div style={{ fontSize: "0.8rem", color: "#888" }}>Mehrere Dateien gleichzeitig möglich</div>
+              <input ref={fileInputRef} type="file" accept=".pdf,application/pdf" multiple onChange={onFileChange} style={{ display: "none" }} />
+            </div>
+
+            {/* Loading */}
+            {loading && (
+              <div style={{ background: "#1c2b1e", borderRadius: 6, padding: "16px 20px", marginBottom: 14, textAlign: "center" }}>
+                <div style={{ color: "#a8c5a0", fontSize: "0.88rem" }}>⏳ {loadingText}</div>
+                <div style={{ background: "#2e4030", borderRadius: 4, height: 4, marginTop: 10, overflow: "hidden" }}>
+                  <div style={{ background: "#7aaa7a", height: "100%", width: "60%", animation: "none" }} />
+                </div>
+              </div>
+            )}
+
+            {/* Toolbar */}
+            {pages.length > 0 && (
+              <div style={{ background: "#fff", border: "1px solid #ddd6c8", borderRadius: 6, padding: "12px 16px", marginBottom: 14, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ fontSize: "0.82rem", color: "#555", marginRight: 4 }}>
+                  <strong>{includedCount}</strong> von <strong>{pages.length}</strong> Seiten ausgewählt
+                </span>
+                <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {btn(includeAll, "✅ Alle an", "#eef5ee", "#1c2b1e", "#a8c5a0")}
+                  {btn(excludeAll, "❌ Alle aus", "#fff5f5", "#c0392b", "#f0a0a0")}
+                  {btn(removeAll, "🗑️ Alle löschen", "#fff", "#888", "#ddd")}
+                </div>
+              </div>
+            )}
+
+            {/* Seiten Grid */}
+            {pages.length > 0 && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 16 }}>
+                {pages.map((page, idx) => (
+                  <div key={page.id} style={{
+                    background: page.included ? "#fff" : "#f0f0f0",
+                    border: `2px solid ${page.included ? "#a8c5a0" : "#ddd"}`,
+                    borderRadius: 6, overflow: "hidden",
+                    opacity: page.included ? 1 : 0.5,
+                    transition: "all 0.15s"
+                  }}>
+                    {/* Vorschaubild */}
+                    <div style={{ position: "relative", cursor: "pointer" }} onClick={() => togglePage(page.id)}>
+                      <img src={page.thumbnail} alt={`Seite ${page.pageNum}`}
+                        style={{ width: "100%", display: "block" }} />
+                      {!page.included && (
+                        <div style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          <span style={{ color: "#fff", fontSize: "1.8rem" }}>✕</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Info */}
+                    <div style={{ padding: "6px 8px" }}>
+                      <div style={{ fontSize: "0.7rem", color: "#888", marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={page.fileName}>
+                        {page.fileName}
+                      </div>
+                      <div style={{ fontSize: "0.72rem", color: "#555", marginBottom: 6 }}>
+                        Seite {page.pageNum}/{page.totalPages}
+                      </div>
+
+                      {/* Buttons */}
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button onClick={() => moveUp(idx)} disabled={idx === 0}
+                          style={{ flex: 1, padding: "4px 0", border: "1px solid #ddd", borderRadius: 3, background: idx === 0 ? "#f5f5f5" : "#fff", cursor: idx === 0 ? "default" : "pointer", fontSize: "0.8rem", color: idx === 0 ? "#ccc" : "#555" }}>↑</button>
+                        <button onClick={() => moveDown(idx)} disabled={idx === pages.length - 1}
+                          style={{ flex: 1, padding: "4px 0", border: "1px solid #ddd", borderRadius: 3, background: idx === pages.length - 1 ? "#f5f5f5" : "#fff", cursor: idx === pages.length - 1 ? "default" : "pointer", fontSize: "0.8rem", color: idx === pages.length - 1 ? "#ccc" : "#555" }}>↓</button>
+                        <button onClick={() => togglePage(page.id)}
+                          style={{ flex: 1, padding: "4px 0", border: `1px solid ${page.included ? "#a8c5a0" : "#ddd"}`, borderRadius: 3, background: page.included ? "#eef5ee" : "#fff", cursor: "pointer", fontSize: "0.75rem", color: page.included ? "#1c2b1e" : "#999" }}>
+                          {page.included ? "✓" : "○"}
+                        </button>
+                        <button onClick={() => removePage(page.id)}
+                          style={{ flex: 1, padding: "4px 0", border: "1px solid #f0a0a0", borderRadius: 3, background: "#fff5f5", cursor: "pointer", fontSize: "0.75rem", color: "#c0392b" }}>✕</button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Zusammenführen Button */}
+            {pages.length > 0 && (
+              <div onClick={!merging && includedCount > 0 ? mergePDFs : undefined}
+                style={{
+                  padding: "16px", background: includedCount > 0 ? "#1c2b1e" : "#ccc",
+                  borderRadius: 6, color: includedCount > 0 ? "#a8c5a0" : "#888",
+                  fontFamily: "'Bebas Neue', sans-serif", fontSize: "1.3rem",
+                  letterSpacing: "0.06em", textAlign: "center",
+                  cursor: includedCount > 0 && !merging ? "pointer" : "default",
+                  userSelect: "none", transition: "all 0.2s"
+                }}>
+                {merging ? "⏳ Wird zusammengefügt..." : `💾 ${includedCount} Seiten als PDF speichern`}
+              </div>
+            )}
+
+            {pages.length === 0 && !loading && (
+              <div style={{ textAlign: "center", padding: "30px", color: "#aaa", fontSize: "0.9rem" }}>
+                Noch keine PDFs geladen
+              </div>
+            )}
+
+            <div style={{ textAlign: "center", color: "#bbb", fontSize: "0.65rem", marginTop: 14 }}>
+              Alle Daten bleiben auf deinem Gerät · DF Gebäudeservice
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js").catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
