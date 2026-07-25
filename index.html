@@ -68,9 +68,10 @@
           setLoadingText(`Lade ${file.name} (${fi + 1}/${pdfFiles.length})...`);
           const arrayBuffer = await file.arrayBuffer();
           const pdfBytes = new Uint8Array(arrayBuffer);
+          const pdfBytesCopy = pdfBytes.slice(); // Kopie sichern BEVOR PDF.js die Daten überträgt!
           const fileId = `file_${Date.now()}_${fi}`;
-          pdfBytesCache.current.set(fileId, pdfBytes); // In Ref speichern, nicht in State
-          const pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes }).promise;
+          pdfBytesCache.current.set(fileId, pdfBytesCopy);
+          const pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes }).promise; // PDF.js darf Original verbrauchen
           for (let pi = 1; pi <= pdfDoc.numPages; pi++) {
             setLoadingText(`${file.name}: Seite ${pi}/${pdfDoc.numPages}`);
             const { dataUrl, w, h } = await renderThumbnail(pdfDoc, pi);
