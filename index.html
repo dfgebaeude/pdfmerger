@@ -179,26 +179,60 @@
           const { PDFDocument, degrees } = PDFLib;
           const merged = await PDFDocument.create();
           const cache = new Map();
+          const failedFiles = new Set();
+          let addedPages = 0;
+
           for (const page of included) {
-            if (!cache.has(page.fileId)) {
-              cache.set(page.fileId, await PDFDocument.load(page.pdfBytes));
+            // Überspringe bereits fehlgeschlagene Dateien
+            if (failedFiles.has(page.fileId)) continue;
+
+            try {
+              if (!cache.has(page.fileId)) {
+                const loaded = await PDFDocument.load(page.pdfBytes, {
+                  ignoreEncryption: true,
+                  updateMetadata: false,
+                });
+                cache.set(page.fileId, loaded);
+              }
+              const src = cache.get(page.fileId);
+              const [copied] = await merged.copyPages(src, [page.pageIndex]);
+              if (page.rotation !== 0) {
+                const existing = copied.getRotation().angle;
+                copied.setRotation(degrees((existing + page.rotation) % 360));
+              }
+              merged.addPage(copied);
+              addedPages++;
+            } catch (pageErr) {
+              console.warn('Fehler bei Datei:', page.fileName, pageErr);
+              failedFiles.add(page.fileId);
             }
-            const src = cache.get(page.fileId);
-            const [copied] = await merged.copyPages(src, [page.pageIndex]);
-            if (page.rotation !== 0) {
-              const existing = copied.getRotation().angle;
-              copied.setRotation(degrees((existing + page.rotation) % 360));
-            }
-            merged.addPage(copied);
           }
+
+          if (addedPages === 0) {
+            alert('Keine Seiten konnten verarbeitet werden.\n\nMögliche Ursachen:\n• PDF ist passwortgeschützt\n• PDF ist beschädigt\n• Nicht unterstütztes PDF-Format');
+            setMerging(false);
+            return;
+          }
+
+          if (failedFiles.size > 0) {
+            const names = [...failedFiles].map(id => {
+              const p = pages.find(x => x.fileId === id);
+              return p ? p.fileName : id;
+            });
+            alert(`⚠️ ${failedFiles.size} Datei(en) konnten nicht verarbeitet werden und wurden übersprungen:\n\n${names.join('\n')}\n\nMögliche Ursachen: Passwortschutz oder beschädigte Datei.\n\nDie restlichen ${addedPages} Seiten werden gespeichert.`);
+          }
+
           const bytes = await merged.save();
           const blob = new Blob([bytes], { type: 'application/pdf' });
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
-          a.href = url; a.download = `DF_${new Date().toLocaleDateString('de-DE').replace(/\./g,'-')}.pdf`;
+          a.href = url;
+          a.download = `DF_${new Date().toLocaleDateString('de-DE').replace(/\./g,'-')}.pdf`;
           a.click();
           setTimeout(() => URL.revokeObjectURL(url), 3000);
-        } catch(e) { alert('Fehler: ' + e.message); }
+        } catch(e) {
+          alert('Unerwarteter Fehler: ' + e.message);
+        }
         setMerging(false);
       };
 
